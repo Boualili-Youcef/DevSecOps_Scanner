@@ -1,0 +1,14 @@
+# Environnements locaux, rapports et identifiants
+.venv*/
+.tools/
+.cache/
+reports*/
+__pycache__/
+*.py[cod]
+.env
+.env.*
+.aws/
+*.tfstate*
+.terraform/
+*.tfplan
+crash.log
