@@ -36,3 +36,5 @@ resource "aws_network_interface" "demo" {
   subnet_id       = "subnet-00000000000000000"
   security_groups = [aws_security_group.demo.id]
 }
+
+# Démonstration de sécurité.
