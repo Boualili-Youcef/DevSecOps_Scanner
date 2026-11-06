@@ -18,6 +18,8 @@ from scripts.github_comment import (
     choisir_artifact,
     choisir_execution,
     generer_commentaire,
+    enregistrer_apercu,
+    echapper_markdown,
     publier_commentaire,
     verifier_archive,
     verifier_manifeste,
@@ -25,7 +27,7 @@ from scripts.github_comment import (
 )
 from scripts.normalize import normaliser_rapports
 from scripts.scan import FICHIERS_RAPPORT
-from test_gemini_review import faux_client
+from test_gemini_review import client_par_lots, faux_client, rapport_mixte
 from test_normalize import exemple_checkov, exemple_trivy
 
 
@@ -269,6 +271,88 @@ class TestsGitHub(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             publier_commentaire(client, 7, revue, provenance)
+
+    def test_commentaire_vingt_constats_details_prioritaires_et_tableau_bref(self):
+        rapport = rapport_mixte()
+        revue = produire_revue(rapport, client=client_par_lots())
+        commentaire = generer_commentaire(revue, "https://github.com/test/test/actions/runs/1")
+        self.assertIn("Constats présentés ici : 20 / 20", commentaire)
+        self.assertEqual(commentaire.count("### "), 5)
+        self.assertEqual(commentaire.count("**Vérification après correction :**"), 5)
+        self.assertIn("Constats présentés brièvement (15)", commentaire)
+        for constat in rapport["findings"]:
+            self.assertIn(echapper_markdown(constat["scanner_id"]), commentaire)
+        self.assertIn("NON FOURNIE", commentaire)
+        self.assertIn("ne signifie pas un risque faible", commentaire)
+
+    def test_budget_ia_les_autres_constats_restent_visibles_avec_action_scanner(self):
+        rapport = rapport_mixte()
+        revue = produire_revue(rapport, client=client_par_lots(), max_lots=1)
+        commentaire = generer_commentaire(revue, "https://github.com/test/test/actions/runs/1")
+        self.assertIn("15 constat(s) sans explication Gemini", commentaire)
+        self.assertIn("Constats présentés ici : 20 / 20", commentaire)
+        self.assertIn("Examiner la version corrigée indiquée par Trivy", commentaire)
+        for constat in rapport["findings"]:
+            self.assertIn(echapper_markdown(constat["scanner_id"]), commentaire)
+
+    def test_rapport_complet_et_commentaire_borne_sans_coupe_silencieuse(self):
+        rapport = rapport_mixte(12, 0, 200, checkov=False)
+        revue = produire_revue(rapport, simulation=True)
+        with tempfile.TemporaryDirectory() as tmp:
+            dossier = Path(tmp)
+            enregistrer_apercu(revue, dossier, "https://github.com/test/test/actions/runs/1", "review-full.md")
+            complet = (dossier / "review-full.md").read_text()
+            apercu = (dossier / "comment-preview.md").read_text()
+        self.assertLessEqual(len(apercu.encode()), 50_000)
+        self.assertIn("constat(s) supplémentaire(s)", apercu)
+        self.assertIn("review-full.md", apercu)
+        self.assertIn("Constats présentés ici : 212 / 212", complet)
+        self.assertEqual(complet.count("### "), 12)
+        for constat in rapport["findings"]:
+            self.assertIn(echapper_markdown(constat["scanner_id"]), complet)
+        self.assertEqual(apercu.count("<details>"), apercu.count("</details>"))
+
+    def test_repli_scanner_echappe_aussi_le_titre_et_les_versions(self):
+        rapport = rapport_mixte(0, 0, 1, checkov=False)
+        rapport["findings"][0]["title"] = "<script>test</script> @personne | colonne"
+        revue = produire_revue(rapport, client=client_par_lots(), max_lots=1)
+        revue["explanations"] = []
+        commentaire = generer_commentaire(revue, "https://github.com/test/test/actions/runs/1")
+        self.assertNotIn("<script>", commentaire)
+        self.assertNotIn("@personne", commentaire)
+        self.assertIn(r"\| colonne", commentaire)
+
+    def test_sans_correctif_le_repli_n_invente_pas_de_version(self):
+        rapport = rapport_mixte(0, 0, 1, checkov=False)
+        rapport["findings"][0]["fixed_version"] = ""
+        revue = produire_revue(rapport, simulation=True)
+        revue["explanations"] = []
+        commentaire = generer_commentaire(revue, "https://github.com/test/test/actions/runs/1")
+        self.assertIn("Aucune version corrigée fournie par Trivy", commentaire)
+
+    def test_fin_de_support_signalee_meme_sans_constats(self):
+        rapport = normaliser_rapports(exemple_checkov(False), exemple_trivy(None, fin_support=True))
+        revue = produire_revue(rapport)
+        commentaire = generer_commentaire(revue, "https://github.com/test/test/actions/runs/1")
+        self.assertIn("fin de support", commentaire)
+        self.assertIn("Statut de sécurité : **ÉCHEC**", commentaire)
+        self.assertIn("Gemini n’a pas été appelé", commentaire)
+
+    def test_ancienne_revue_ne_masque_pas_les_constats_non_selectionnes(self):
+        rapport = rapport_mixte(1, 0, 6, checkov=False)
+        revue = produire_revue(rapport, simulation=True)
+        revue["schema_version"] = 1
+        revue["selected_findings"] = rapport["findings"][:1]
+        revue["explanations"] = revue["explanations"][:1]
+        commentaire = generer_commentaire(revue, "https://github.com/test/test/actions/runs/1")
+        self.assertIn("Constats présentés ici : 7 / 7", commentaire)
+        self.assertIn("6 constat(s) sans explication Gemini", commentaire)
+
+    def test_douze_critiques_toutes_detaillees_dans_le_commentaire(self):
+        revue = produire_revue(rapport_mixte(12, 0, 0, checkov=False), client=client_par_lots())
+        commentaire = generer_commentaire(revue, "https://github.com/test/test/actions/runs/1")
+        self.assertEqual(commentaire.count("### "), 12)
+        self.assertIn("Constats présentés ici : 12 / 12", commentaire)
 
 
 if __name__ == "__main__":

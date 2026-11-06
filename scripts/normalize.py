@@ -292,23 +292,15 @@ def normaliser_rapports(rapport_checkov, rapport_trivy):
 
 
 def selectionner_constats(rapport):
-    """Garder au plus cinq constats, en représentant les deux scanners si possible."""
-    selection = []
+    """Conserver tous les constats, classés par la gravité du scanner."""
+    return sorted(rapport["findings"], key=cle_priorite)
 
-    for scanner in ("Checkov", "Trivy"):
-        for constat in rapport["findings"]:
-            if constat["scanner"] == scanner:
-                selection.append(constat)
-                break
 
-    for constat in rapport["findings"]:
-        if len(selection) >= 5:
-            break
-
-        if constat not in selection:
-            selection.append(constat)
-
-    return selection
+def constat_prioritaire(constat):
+    # Une gravité absente ne permet pas de conclure à un risque faible.
+    return constat["scanner"] == "Checkov" or constat["severity"] in (
+        "CRITICAL", "HIGH", "UNKNOWN",
+    )
 
 
 def generer_resume_markdown(rapport):
