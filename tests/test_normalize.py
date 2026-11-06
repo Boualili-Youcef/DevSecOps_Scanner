@@ -8,6 +8,7 @@ from pathlib import Path
 
 from scripts.normalize import (
     charger_json,
+    constat_prioritaire,
     generer_resume_markdown,
     lire_gravite,
     nettoyer_texte,
@@ -168,7 +169,7 @@ class TestsNormalisation(unittest.TestCase):
         self.assertEqual(premier, second)
         self.assertEqual(premier["counts"]["trivy"], 1)
 
-    def test_selection_limitee_et_deux_scanners_representes(self):
+    def test_tous_les_constats_conserves_et_critiques_en_premier(self):
         trivy = exemple_trivy("CRITICAL")
         modele = trivy["Results"][0]["Vulnerabilities"][0]
         trivy["Results"][0]["Vulnerabilities"] = [
@@ -178,8 +179,20 @@ class TestsNormalisation(unittest.TestCase):
         rapport = normaliser_rapports(exemple_checkov(), trivy)
         selection = selectionner_constats(rapport)
 
-        self.assertEqual(len(selection), 5)
+        self.assertEqual(len(selection), 11)
         self.assertEqual({constat["scanner"] for constat in selection}, {"Checkov", "Trivy"})
+        self.assertTrue(all(c["severity"] == "CRITICAL" for c in selection[:10]))
+        self.assertEqual(selection[-1]["scanner"], "Checkov")
+
+    def test_absence_de_gravite_ne_signifie_pas_faible_priorite(self):
+        for scanner, gravite, attendu in (
+            ("Checkov", "UNKNOWN", True), ("Checkov", "LOW", True),
+            ("Trivy", "CRITICAL", True), ("Trivy", "HIGH", True),
+            ("Trivy", "UNKNOWN", True), ("Trivy", "MEDIUM", False),
+            ("Trivy", "LOW", False),
+        ):
+            with self.subTest(scanner=scanner, gravite=gravite):
+                self.assertEqual(constat_prioritaire({"scanner": scanner, "severity": gravite}), attendu)
 
     def test_resume_conserve_le_format_github(self):
         rapport = normaliser_rapports(exemple_checkov(), exemple_trivy())

@@ -12,7 +12,10 @@ import zipfile
 from pathlib import Path
 from urllib.parse import urlencode, urlsplit
 
-from scripts.normalize import LIBELLES_GRAVITE, charger_json, normaliser_rapports
+from scripts.normalize import (
+    LIBELLES_GRAVITE, charger_json, constat_prioritaire,
+    normaliser_rapports, selectionner_constats,
+)
 from scripts.scan import FICHIERS_RAPPORT, enregistrer_json
 
 
@@ -255,96 +258,191 @@ def echapper_markdown(texte):
     return re.sub(r"([\\`*_{}\[\]()#+.!|>~-])", r"\\\1", texte)
 
 
-def generer_commentaire(revue, adresse_execution):
+def emplacement_constat(constat):
+    if constat["scanner"] == "Trivy":
+        return (
+            f"Paquet : {constat['package']} ; version installée : "
+            f"{constat['installed_version']} ; correction du scanner : "
+            f"{constat['fixed_version'] or 'non fournie'}"
+        )
+    debut, fin = constat["lines"]
+    return f"Alias du fichier : {constat['location']} ; lignes du scanner : {debut}–{fin}"
+
+
+def recommandation_scanner(constat):
+    if constat["scanner"] == "Trivy":
+        if constat["fixed_version"]:
+            return (
+                f"Examiner la version corrigée indiquée par Trivy : {constat['fixed_version']}. "
+                "Mettre à jour le paquet ou l’image qui le fournit, puis relancer Trivy."
+            )
+        return (
+            "Aucune version corrigée fournie par Trivy. Examiner les mesures de "
+            "réduction du risque et les mises à jour disponibles, puis relancer le scan."
+        )
+    if constat["scanner_id"] == "CKV_AWS_24":
+        return "Restreindre les sources autorisées pour SSH aux réseaux nécessaires, puis relancer Checkov."
+    return "Examiner la configuration au regard du contrôle Checkov indiqué, la corriger puis relancer Checkov."
+
+
+def bloc_detaille(constat, explication, simulation):
+    reference = echapper_markdown(constat["scanner_id"])
+    gravite = LIBELLES_GRAVITE[constat["severity"]]
+    source = "SIMULATION" if simulation else "Gemini"
+    lignes = [
+        f"### {reference} — {gravite} ({constat['scanner']})", "",
+        echapper_markdown(constat["title"]), "",
+        echapper_markdown(emplacement_constat(constat)), "",
+    ]
+    if explication is not None:
+        lignes.append(f"Conseils : {source} ; à vérifier dans le contexte du projet.")
+        for etiquette, cle in (
+            ("Risque", "risk"), ("Impact potentiel", "impact"),
+            ("Correction recommandée", "recommendation"),
+            ("Vérification après correction", "verification"),
+            ("Incertitude", "uncertainty"),
+        ):
+            if cle in explication:
+                lignes.append(f"- **{etiquette} :** {echapper_markdown(explication[cle])}")
+    else:
+        lignes.extend([
+            "**Informations du scanner — explication IA indisponible.**",
+            f"- **Action :** {echapper_markdown(recommandation_scanner(constat))}",
+            "- **Incertitude :** le contexte et l’exploitabilité restent à vérifier.",
+        ])
+    return "\n".join(lignes) + "\n"
+
+
+def ligne_breve(constat, explication, simulation):
+    source = "SIMULATION" if simulation else "Gemini"
+    resume = constat["title"]
+    action = recommandation_scanner(constat)
+    incertitude = "Informations du scanner ; contexte et exploitabilité à vérifier."
+    if explication is not None:
+        resume = explication.get("summary", explication.get("risk", resume))
+        action = explication["recommendation"]
+        incertitude = f"{source} : {explication['uncertainty']}"
+    cellules = (
+        f"{constat['scanner_id']} ({constat['scanner']})",
+        LIBELLES_GRAVITE[constat["severity"]],
+        emplacement_constat(constat), resume, f"{action} {incertitude}",
+    )
+    return "| " + " | ".join(echapper_markdown(c) for c in cellules) + " |\n"
+
+
+def generer_commentaire(revue, adresse_execution, *, adresse_rapport=None, limite=50_000):
+    """Présenter tous les constats ; conserver le détail intégral dans le rapport joint."""
     rapport = revue["report"]
+    constats = selectionner_constats(rapport)
     compteurs = rapport["counts"]
     titre = "Revue de sécurité IA"
-
     if revue["simulated"]:
         titre += " — SIMULATION (aucun appel à Gemini)"
-
     lignes = [
-        MARQUEUR_COMMENTAIRE,
-        f"## {titre}",
-        "",
+        MARQUEUR_COMMENTAIRE, f"## {titre}", "",
         f"- Statut de sécurité : **{'ÉCHEC' if rapport['status'] == 'FAILED' else 'RÉUSSI'}**",
         f"- Constats Checkov : {compteurs['checkov']}",
         f"- Constats Trivy : {compteurs['trivy']}",
         f"- Critiques : {compteurs['critical']}",
-        f"- Élevées : {compteurs['high']}",
-        "",
+        f"- Élevées : {compteurs['high']}", "",
         "Les scanners déterminent le statut. Le développeur doit vérifier les conseils de l’IA.",
-        "La gravité Checkov est indiquée « NON FOURNIE » si elle est absente du rapport.",
-        "",
+        "Les constats critiques, élevés, sans gravité et les échecs Checkov sont examinés en priorité.",
+        "Une gravité « NON FOURNIE » ne signifie pas un risque faible.", "",
     ]
-    explications = {element["id"]: element for element in revue["explanations"]}
-
-    for constat in revue["selected_findings"]:
-        explication = explications[constat["id"]]
-        reference = echapper_markdown(constat["scanner_id"])
-        gravite = LIBELLES_GRAVITE[constat["severity"]]
-        titre_constat = "Configuration Terraform à corriger"
-
-        if constat["scanner"] == "Trivy":
-            paquet = echapper_markdown(constat["package"])
-            titre_constat = f"Vulnérabilité du paquet {paquet}"
+    explications = {e["id"]: e for e in revue["explanations"]}
+    sans_ia = sum(c["id"] not in explications for c in constats)
+    if sans_ia:
         lignes.extend([
-            f"### {reference} — {gravite} ({constat['scanner']})",
-            "",
-            titre_constat,
-            "",
+            f"**Revue IA incomplète : {sans_ia} constat(s) sans explication Gemini.**",
+            "Leurs informations et actions issues des scanners restent disponibles ci-dessous et dans le rapport complet.",
+            "Le budget d’appels, une erreur API ou une réponse invalide peut interrompre l’enrichissement IA.", "",
         ])
-
-        if constat["scanner"] == "Trivy":
-            paquet = echapper_markdown(constat["package"])
-            version = echapper_markdown(constat["installed_version"])
-            correction = echapper_markdown(constat["fixed_version"] or "non fournie")
-            lignes.append(
-                f"Paquet : {paquet} ; version installée : {version} ; "
-                f"correction du scanner : {correction}"
-            )
-        else:
-            alias = echapper_markdown(constat["location"])
-            debut, fin = constat["lines"]
-            lignes.append(f"Alias du fichier : {alias} ; lignes du scanner : {debut}–{fin}")
-
-        lignes.append("")
-
-        for etiquette, cle in (
-            ("Risque", "risk"), ("Impact potentiel", "impact"),
-            ("Correction recommandée", "recommendation"), ("Incertitude", "uncertainty"),
-        ):
-            lignes.append(f"- **{etiquette} :** {echapper_markdown(explication[cle])}")
-
-        lignes.append("")
-
+    pied = [""]
     for raison in rapport["policy_reasons"]:
-        lignes.append(f"- Règle de blocage : {echapper_markdown(raison)}")
-
+        pied.append(f"- Règle de blocage : {echapper_markdown(raison)}")
     mesures = revue["metrics"]
-    lignes.extend([
-        "",
-        f"Constats analysés : {mesures['findings_analyzed']}",
-    ])
-
+    pied.extend(["", f"Constats analysés par Gemini : {mesures['findings_analyzed']} / {len(constats)}"])
+    if revue["simulated"]:
+        pied.append(f"Explications simulées : {len(explications)} ; aucun appel réel.")
     for cle, etiquette in (
-        ("duration_seconds", "Durée de l’appel IA (s)"),
-        ("input_tokens", "Tokens en entrée"),
-        ("output_tokens", "Tokens en sortie"),
-        ("thinking_tokens", "Tokens de réflexion"),
+        ("batches_attempted", "Lots IA tentés"),
+        ("duration_seconds", "Durée des appels IA réussis (s)"),
+        ("input_tokens", "Tokens en entrée des appels réussis"),
+        ("output_tokens", "Tokens en sortie des appels réussis"),
+        ("thinking_tokens", "Tokens de réflexion des appels réussis"),
     ):
-        if mesures[cle] is not None:
-            lignes.append(f"- {etiquette} : {mesures[cle]}")
+        if mesures.get(cle) is not None:
+            pied.append(f"- {etiquette} : {mesures[cle]}")
+    if not constats:
+        pied.extend(["", "Aucun constat à expliquer ; Gemini n’a pas été appelé."])
+    pied.extend(["", f"[Exécution du scan de sécurité]({adresse_execution})"])
+    if adresse_rapport:
+        pied.append(f"[Rapport complet (review-full.md ; archive security-review sur GitHub)]({adresse_rapport})")
+    else:
+        pied.append(f"[Rapports complets des scanners — artifacts du scan]({adresse_execution})")
+    pied.append("")
 
-    if not revue["selected_findings"]:
-        lignes.extend(["", "Aucun constat à expliquer ; Gemini n’a pas été appelé."])
+    # Réserver la place du bilan et des balises : aucune coupe au milieu d’un
+    # constat ou d'une structure Markdown. La limite porte sur les octets UTF-8.
+    budget = None if limite is None else limite - len("\n".join(lignes + pied).encode()) - 1000
+    if budget is not None and budget < 0:
+        raise ValueError("Limite de commentaire trop petite pour le résumé")
+    entrees = [(c, explications.get(c["id"])) for c in constats]
+    breves = [ligne_breve(c, e, revue["simulated"]) for c, e in entrees]
+    reste_bref = sum(len(b.encode()) for b in breves)
+    details, resumes = [], []
+    affiches = 0
+    for (constat, explication), bref in zip(entrees, breves):
+        cout_bref = len(bref.encode())
+        reste_bref -= cout_bref
+        bloc = bloc_detaille(constat, explication, revue["simulated"])
+        cout_detail = len(bloc.encode())
+        if constat_prioritaire(constat) and (
+            budget is None or cout_detail + reste_bref <= budget
+        ):
+            details.append(bloc)
+            cout = cout_detail
+        elif budget is None or cout_bref <= budget:
+            resumes.append(bref)
+            cout = cout_bref
+        else:
+            continue
+        affiches += 1
+        if budget is not None:
+            budget -= cout
+    lignes.extend([f"**Constats présentés ici : {affiches} / {len(constats)}.**", ""])
+    if affiches < len(constats):
+        lignes.extend([
+            f"**{len(constats) - affiches} constat(s) supplémentaire(s) dans le rapport complet lié ci-dessous.**",
+            "La taille du commentaire est limitée ; le rapport complet conserve chaque constat et chaque explication disponible.", "",
+        ])
+    if details:
+        lignes.extend(["## Problèmes prioritaires", "", *details])
+    if resumes:
+        lignes.extend([
+            "<details>", f"<summary>Constats présentés brièvement ({len(resumes)})</summary>", "",
+            "Les problèmes prioritaires peuvent aussi être abrégés ici si le commentaire est volumineux ; consulter le rapport complet pour leur détail.", "",
+            "| Constat | Gravité | Élément concerné | Explication courte | Action et incertitude |",
+            "|---|---|---|---|---|", *[b.rstrip("\n") for b in resumes], "", "</details>", "",
+        ])
+    commentaire = "\n".join(lignes + pied)
+    if limite is not None and len(commentaire.encode()) > limite:
+        raise ValueError("Commentaire trop volumineux")
+    return commentaire
 
-    lignes.extend(["", f"[Exécution du scan de sécurité]({adresse_execution})", ""])
 
-    return "\n".join(lignes)
+def enregistrer_apercu(revue, dossier, adresse_execution, adresse_rapport=None):
+    dossier.mkdir(parents=True, exist_ok=True)
+    (dossier / "review-full.md").write_text(
+        generer_commentaire(revue, adresse_execution, limite=None), encoding="utf-8",
+    )
+    commentaire = generer_commentaire(
+        revue, adresse_execution, adresse_rapport=adresse_rapport,
+    )
+    (dossier / "comment-preview.md").write_text(commentaire, encoding="utf-8")
 
 
-def publier_commentaire(client, numero, revue, provenance):
+def publier_commentaire(client, numero, revue, provenance, *, adresse_rapport=None):
     if revue["simulated"]:
         raise ValueError("Publication d'une simulation interdite")
 
@@ -354,7 +452,7 @@ def publier_commentaire(client, numero, revue, provenance):
         raise ValueError("La PR a changé : relancer le scan et la revue")
 
     adresse = f"https://github.com/{client.depot}/actions/runs/{provenance['run_id']}"
-    commentaire = generer_commentaire(revue, adresse)
+    commentaire = generer_commentaire(revue, adresse, adresse_rapport=adresse_rapport)
     commentaires = client.lister(f"issues/{numero}/comments")
     existants = [
         element for element in commentaires
@@ -384,8 +482,12 @@ def principal():
 
     if options.action == "apercu":
         revue = charger_json(options.revue)
-        commentaire = generer_commentaire(revue, "https://github.com/OWNER/REPO/actions")
-        (dossier / "comment-preview.md").write_text(commentaire, encoding="utf-8")
+        provenance = dossier / "provenance.json"
+        adresse = (
+            charger_json(provenance)["run_url"] if provenance.is_file()
+            else "https://github.com/OWNER/REPO/actions"
+        )
+        enregistrer_apercu(revue, dossier, adresse, "review-full.md")
         print("Aperçu local créé ; aucun commentaire publié")
         return
 
@@ -397,9 +499,17 @@ def principal():
     if options.action == "recuperer":
         recuperer_rapports(client, options.pr, dossier)
     else:
+        revue = charger_json(options.revue)
+        provenance = charger_json(dossier / "provenance.json")
+        execution_revue = os.environ.get("GITHUB_RUN_ID", "")
+        adresse_rapport = (
+            f"https://github.com/{client.depot}/actions/runs/{execution_revue}"
+            if execution_revue.isdigit() else None
+        )
+        adresse_scan = f"https://github.com/{client.depot}/actions/runs/{provenance['run_id']}"
+        enregistrer_apercu(revue, dossier, adresse_scan, adresse_rapport)
         publier_commentaire(
-            client, options.pr, charger_json(options.revue),
-            charger_json(dossier / "provenance.json"),
+            client, options.pr, revue, provenance, adresse_rapport=adresse_rapport,
         )
 
 

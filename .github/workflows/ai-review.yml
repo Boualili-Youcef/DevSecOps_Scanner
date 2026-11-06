@@ -44,11 +44,22 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: python -m scripts.github_comment recuperer --pr "$PR_NUMBER"
-      - name: Expliquer les constats prioritaires avec Gemini
+      - name: Expliquer les constats par priorité et par lots avec Gemini
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GEMINI_MODEL: ${{ vars.GEMINI_MODEL || 'gemini-3.5-flash-lite' }}
         run: python -m scripts.gemini_review
+      - name: Préparer le commentaire et le rapport complet
+        run: python -m scripts.github_comment apercu
+      - name: Conserver toutes les explications et les informations des scanners
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: security-review-${{ inputs.pr_number }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            reports/review.json
+            reports/review-full.md
+          retention-days: 7
+          if-no-files-found: error
       - name: Mettre à jour le commentaire de la PR
         env:
           GH_TOKEN: ${{ github.token }}
